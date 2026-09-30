@@ -20,6 +20,8 @@ configured. It is the reusable part: one definition can back many instances.
 | `Environment` | no | Drives defaults such as replica count. Defaults to `dev`. |
 | `Replicas` | no | Overrides the replica count derived from `Environment`. |
 | `RunMigrations` | no | Runs `django-admin migrate` before the app is made available. Defaults to `true`, because Django requires it on any schema change. |
+| `Env` | no | Extra literal environment variables as `KEY=VALUE` entries, applied to every instance. Stored encrypted. See [Environment variables](#environment-variables). |
+| `SecretEnvVars` | no | Extra environment variables read from an existing Kubernetes secret (`Name`, `SecretName`, `SecretKey`), applied to every instance. |
 
 **`DjangoInstance`** is a running deployment of a definition.
 
@@ -28,6 +30,55 @@ configured. It is the reusable part: one definition can back many instances.
 | `SubDomain` | no | The subdomain used to reach this instance when a domain name is attached. Not yet acted on — see limitations. |
 | `KubernetesRuntimeInstanceID` | no | The runtime to deploy to. Falls back to the control plane's default runtime when unset. |
 | `DjangoDefinitionID` | yes | The definition this instance deploys. |
+| `Env` | no | Literal environment variables for this instance only. A name also set on the definition overrides it. Stored encrypted. |
+| `SecretEnvVars` | no | Secret-referenced environment variables for this instance only. Overrides same-named definition variables. |
+
+### Environment variables
+
+Both objects accept `Env` (literal `KEY=VALUE` entries) and `SecretEnvVars`
+(references to a key in a Kubernetes secret). They reach the application
+container and the migration job.
+
+Definition-level variables are baked into the shared manifest, so every
+instance gets them. Instance-level variables are rendered as a Kustomize
+strategic merge patch on the instance's workload, so they add to the
+definition's and, when a name is set on both, the instance's value wins
+regardless of whether either side used a literal or a secret reference. Other
+instances of the same definition are unaffected.
+
+```yaml
+# samples/django-definition.yaml
+DjangoDefinition:
+  Name: myapp
+  Env:
+    - FEATURE_X=off
+    - DB_HOST=myapp-postgres        # host and port are not secret
+    - DB_PORT=5432
+  SecretEnvVars:
+    # the password the module generates for the database
+    - Name: DB_PASSWORD
+      SecretName: myapp-db
+      SecretKey: POSTGRES_PASSWORD
+
+# samples/django-instance.yaml
+DjangoInstance:
+  Name: myapp-prod
+  DjangoDefinition:
+    Name: myapp
+  Env:
+    - FEATURE_X=on                  # overrides the definition's value
+  SecretEnvVars:
+    # a secret you created in the target namespace beforehand
+    - Name: POSTMARK_API_KEY
+      SecretName: myapp-prod-postmark
+      SecretKey: api-key
+```
+
+`DATABASE_URL`, `SECRET_KEY`, `DJANGO_SETTINGS_MODULE` and `PYTHONPATH` are set
+by the module and cannot be overridden. A name may appear once per object,
+in either `Env` or `SecretEnvVars`. `tptctl ... get` redacts `Env` values
+unless `--decrypt-secrets` is passed. Environment variables are applied when
+the object is created: a replace that changes them is rejected (see limitations).
 
 ## Status
 
@@ -136,6 +187,14 @@ to `prod` reads as `prod` in `get` and still runs one replica labelled `dev`.
 Until the update reconcilers are written, changing a deployed application means
 deleting and recreating it. Filling in the config abstractions is what made this
 path reachable - before that a config file could not express the fields at all.
+
+**Environment variables cannot be changed after creation.** Definition
+variables are rendered into the workload definition once, and an instance's are
+set as the workload instance's Kustomize overlay, which Threeport treats as
+immutable. `replace` rejects a change to the set of `Env` names or to
+`SecretEnvVars`. Literal `Env` values are encrypted and cannot be compared, so
+editing only a value under an unchanged name is not detected and is not
+applied. Create a new definition or instance to change them.
 
 **`SubDomain` is stored but not acted on.** Reaching an instance by subdomain
 needs a gateway and a domain name attached to it, which is a second set of

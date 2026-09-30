@@ -19,7 +19,28 @@ var (
 	djangoStdin      bool
 	djangoVersion    string
 	djangoOutput     string
+	djangoDecrypt    bool
 )
+
+// getEncryptionKey returns the control plane's encryption key when the user
+// asked for secrets to be decrypted, and an empty string otherwise, which makes
+// the config layer redact encrypted values instead.
+func getEncryptionKey(requestedControlPlane string) string {
+	if !djangoDecrypt {
+		return ""
+	}
+	threeportConfig, _, err := cli.GetThreeportConfig(cliArgs.ControlPlaneName)
+	if err != nil {
+		cli.Error("failed to get threeport config", err)
+		os.Exit(1)
+	}
+	key, err := threeportConfig.GetThreeportEncryptionKey(requestedControlPlane)
+	if err != nil {
+		cli.Error("failed to get encryption key from threeport config", err)
+		os.Exit(1)
+	}
+	return key
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Django
@@ -68,7 +89,7 @@ var GetDjangosCmd = &cobra.Command{
 			}
 
 			// get django
-			djangoConfigs, err := djangoConfig.Get(apiClient, apiEndpoint)
+			djangoConfigs, err := djangoConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django", err)
 				os.Exit(1)
@@ -136,6 +157,10 @@ func init() {
 	GetDjangosCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangosCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 
@@ -325,7 +350,7 @@ var GetDjangoDefinitionsCmd = &cobra.Command{
 			}
 
 			// get django definitions
-			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint)
+			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django definitions", err)
 				os.Exit(1)
@@ -393,6 +418,10 @@ func init() {
 	GetDjangoDefinitionsCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangoDefinitionsCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 
@@ -651,7 +680,7 @@ var GetDjangoInstancesCmd = &cobra.Command{
 			}
 
 			// get django instances
-			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint)
+			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django instances", err)
 				os.Exit(1)
@@ -719,6 +748,10 @@ func init() {
 	GetDjangoInstancesCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangoInstancesCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 

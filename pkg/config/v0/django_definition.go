@@ -47,6 +47,14 @@ type DjangoDefinitionValues struct {
 	// available. Left unset, the API defaults it to true.
 	RunMigrations *bool
 
+	// Additional literal environment variables as KEY=VALUE entries, applied to
+	// every instance of the definition. Stored encrypted.
+	Env *[]string
+
+	// Additional environment variables sourced from existing Kubernetes
+	// secrets, applied to every instance of the definition.
+	SecretEnvVars []DjangoSecretEnvVarValues
+
 	Age *string
 }
 
@@ -56,6 +64,7 @@ type DjangoDefinitionValues struct {
 func (d *DjangoDefinitionConfig) Get(
 	apiClient *http.Client,
 	apiEndpoint string,
+	encryptionKey string,
 ) (*[]DjangoDefinitionConfig, error) {
 	djangoDefinitionValues := d.DjangoDefinition
 
@@ -81,6 +90,13 @@ func (d *DjangoDefinitionConfig) Get(
 	// assemble config objects from API objects
 	var djangoDefinitionConfigs []DjangoDefinitionConfig
 	for _, djangoDefinition := range *djangoDefinitions {
+		// literal env values are encrypted at rest: decrypt when the caller
+		// supplied the key, redact otherwise
+		djangoDefinition, err := decryptOrRedactDefinition(djangoDefinition, encryptionKey)
+		if err != nil {
+			return nil, err
+		}
+
 		djangoDefinitionConfig := DjangoDefinitionConfig{
 			DjangoDefinition: DjangoDefinitionValues{
 				Name:           djangoDefinition.Name,
@@ -89,6 +105,8 @@ func (d *DjangoDefinitionConfig) Get(
 				Environment:    djangoDefinition.Environment,
 				Replicas:       djangoDefinition.Replicas,
 				RunMigrations:  djangoDefinition.RunMigrations,
+				Env:            djangoDefinition.Env,
+				SecretEnvVars:  secretEnvVarsFromAPI(djangoDefinition.SecretEnvVars),
 				Age:            util.Ptr(util.GetAgeFormatted(djangoDefinition.CreatedAt)),
 			},
 		}
@@ -126,6 +144,8 @@ func (d *DjangoDefinitionConfig) Create(
 		Environment:    djangoDefinitionValues.Environment,
 		Replicas:       djangoDefinitionValues.Replicas,
 		RunMigrations:  djangoDefinitionValues.RunMigrations,
+		Env:            djangoDefinitionValues.Env,
+		SecretEnvVars:  secretEnvVarsToAPI(djangoDefinitionValues.SecretEnvVars),
 	}
 
 	// create django definition
@@ -147,6 +167,8 @@ func (d *DjangoDefinitionConfig) Create(
 			Environment:    createdDjangoDefinition.Environment,
 			Replicas:       createdDjangoDefinition.Replicas,
 			RunMigrations:  createdDjangoDefinition.RunMigrations,
+			Env:            createdDjangoDefinition.Env,
+			SecretEnvVars:  secretEnvVarsFromAPI(createdDjangoDefinition.SecretEnvVars),
 			Age:            util.Ptr(util.GetAgeFormatted(createdDjangoDefinition.CreatedAt)),
 		},
 	}
@@ -180,6 +202,18 @@ func (d *DjangoDefinitionConfig) Replace(
 		return nil, fmt.Errorf("failed to find django definition with name %s: %w", name, err)
 	}
 
+	// the environment is rendered into the workload definition once, at
+	// creation, so a replace cannot change it
+	if err := checkEnvUnchanged(
+		"django definition",
+		djangoDefinitionValues.Env,
+		djangoDefinitionValues.SecretEnvVars,
+		existingDjangoDefinition.Env,
+		existingDjangoDefinition.SecretEnvVars,
+	); err != nil {
+		return nil, err
+	}
+
 	// construct updated django definition object. This is a full replacement, so
 	// every field the user can set is sent: a field left out of the config is
 	// meant to be cleared, not carried over from the existing object.
@@ -195,6 +229,11 @@ func (d *DjangoDefinitionConfig) Replace(
 		Environment:    djangoDefinitionValues.Environment,
 		Replicas:       djangoDefinitionValues.Replicas,
 		RunMigrations:  djangoDefinitionValues.RunMigrations,
+
+		// carried over as stored: the values are ciphertext, which the API
+		// recognises and does not encrypt again
+		Env:           existingDjangoDefinition.Env,
+		SecretEnvVars: existingDjangoDefinition.SecretEnvVars,
 
 		// the workload definition is an owned relationship the reconciler sets,
 		// not something the user configures. A replacement that left it out
@@ -222,6 +261,8 @@ func (d *DjangoDefinitionConfig) Replace(
 			Environment:    replacedDjangoDefinition.Environment,
 			Replicas:       replacedDjangoDefinition.Replicas,
 			RunMigrations:  replacedDjangoDefinition.RunMigrations,
+			Env:            replacedDjangoDefinition.Env,
+			SecretEnvVars:  secretEnvVarsFromAPI(replacedDjangoDefinition.SecretEnvVars),
 			Age:            util.Ptr(util.GetAgeFormatted(replacedDjangoDefinition.CreatedAt)),
 		},
 	}
@@ -319,6 +360,10 @@ func (d *DjangoDefinitionConfig) Validate() error {
 			"invalid value in config for Replicas: %d: must not be negative",
 			*djangoDefinitionValues.Replicas,
 		))
+	}
+
+	if err := validateEnvVars(djangoDefinitionValues.Env, djangoDefinitionValues.SecretEnvVars); err != nil {
+		multiError.AppendError(err)
 	}
 
 	return multiError.Error()

@@ -31,6 +31,18 @@ type DjangoDefinition struct {
 	// so it defaults to true.
 	RunMigrations *bool `validate:"optional" gorm:"default:true"`
 
+	// Env holds additional literal environment variables as KEY=VALUE
+	// entries, applied to every instance of this definition. Encrypted at
+	// rest, since a value here may be a real credential rather than a
+	// reference to one - same shape and handling as
+	// MachineWorkloadDefinition.Env.
+	Env *[]string `validate:"optional" gorm:"type:jsonb;serializer:json" encrypt:"true"`
+
+	// SecretEnvVars are additional environment variables sourced from an
+	// existing Kubernetes secret, applied to every instance of this
+	// definition. Nothing here is plaintext, so nothing needs encryption.
+	SecretEnvVars *[]DjangoSecretEnvVar `validate:"optional" gorm:"type:jsonb;serializer:json"`
+
 	// The Kubernetes workload definition carrying the manifests this module
 	// generates for the Django app and its database. The relationship tag has
 	// the API create the attached object reference, so the workload definition
@@ -49,6 +61,15 @@ type DjangoInstance struct {
 	// instance.
 	SubDomain *string `validate:"optional"`
 
+	// Env is the instance-scoped equivalent of DjangoDefinition.Env. A KEY
+	// present here overrides the same KEY on the definition, for this
+	// instance only. Applied when the instance is created.
+	Env *[]string `validate:"optional" gorm:"type:jsonb;serializer:json" encrypt:"true"`
+
+	// SecretEnvVars is the instance-scoped equivalent of
+	// DjangoDefinition.SecretEnvVars.
+	SecretEnvVars *[]DjangoSecretEnvVar `validate:"optional" gorm:"type:jsonb;serializer:json"`
+
 	// The Kubernetes runtime to deploy this instance to. When unset the
 	// module falls back to the default runtime, so a user with one cluster
 	// does not have to name it.
@@ -59,4 +80,12 @@ type DjangoInstance struct {
 	KubernetesWorkloadInstanceID *uint `validate:"optional" relationship:"owns"`
 
 	DjangoDefinitionID *uint `validate:"required" gorm:"not null"`
+}
+
+// DjangoSecretEnvVar is an additional environment variable sourced from an
+// existing secret key rather than a literal value.
+type DjangoSecretEnvVar struct {
+	Name       string `json:"Name"`
+	SecretName string `json:"SecretName"`
+	SecretKey  string `json:"SecretKey"`
 }

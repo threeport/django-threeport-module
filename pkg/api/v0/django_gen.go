@@ -5,6 +5,7 @@ package v0
 import (
 	"encoding/json"
 	"fmt"
+	lib "github.com/threeport/threeport/pkg/api/lib/v0"
 	api "github.com/threeport/threeport/pkg/api/v0"
 	notifications "github.com/threeport/threeport/pkg/notifications/v0"
 	"time"
@@ -95,6 +96,19 @@ func (d *DjangoDefinition) RelationshipTaggedForeignKeys() []api.RelationshipTag
 	}}
 }
 
+// AssociationTypes returns the fully-qualified type names of children referenced via has-many association slices on DjangoDefinition.
+func (d *DjangoDefinition) AssociationTypes() []string {
+	return []string{new(DjangoInstance).GetFullyQualifiedType()}
+}
+
+// EncryptedFields returns the encrypt-tagged fields on DjangoDefinition.
+func (d *DjangoDefinition) EncryptedFields() []lib.EncryptedField {
+	return []lib.EncryptedField{{
+		Name:  "Env",
+		Value: d.Env,
+	}}
+}
+
 // NotificationPayload returns the notification payload that is delivered to the
 // controller when a change is made.  It includes the object as presented by the
 // client when the change was made.
@@ -172,5 +186,13 @@ func (d *DjangoInstance) RelationshipTaggedForeignKeys() []api.RelationshipTagge
 		ObjectID:     d.KubernetesWorkloadInstanceID,
 		ObjectType:   new(api.KubernetesWorkloadInstance).GetFullyQualifiedType(),
 		Relationship: api.RelationshipOwns,
+	}}
+}
+
+// EncryptedFields returns the encrypt-tagged fields on DjangoInstance.
+func (d *DjangoInstance) EncryptedFields() []lib.EncryptedField {
+	return []lib.EncryptedField{{
+		Name:  "Env",
+		Value: d.Env,
 	}}
 }

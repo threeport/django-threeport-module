@@ -11,6 +11,7 @@ import (
 	tpclientlib "github.com/threeport/threeport/pkg/client/lib/v0"
 	tpclient "github.com/threeport/threeport/pkg/client/v0"
 	controller "github.com/threeport/threeport/pkg/controller/v0"
+	encryption "github.com/threeport/threeport/pkg/encryption/v0"
 
 	v0 "django-threeport-module/pkg/api/v0"
 	client_v0 "django-threeport-module/pkg/client/v0"
@@ -69,6 +70,13 @@ func v0DjangoInstanceCreated(
 
 	var workloadInstance *tpapi.KubernetesWorkloadInstance
 	if len(*existingWorkloadInstances) == 0 {
+		// the overlay is immutable once set on the workload instance, so
+		// instance env vars are applied here at creation, not on adoption
+		overlay, err := instanceOverlay(r, djangoDefinition, djangoInstance)
+		if err != nil {
+			return 0, err
+		}
+
 		created, err := tpclient.CreateKubernetesWorkloadInstance(
 			r.APIClient,
 			r.APIServer,
@@ -76,6 +84,7 @@ func v0DjangoInstanceCreated(
 				Instance:                       tpapi.Instance{Name: djangoInstance.Name},
 				KubernetesRuntimeInstanceID:    runtimeInstanceId,
 				KubernetesWorkloadDefinitionID: djangoDefinition.KubernetesWorkloadDefinitionID,
+				KustomizeOverlay:               overlay,
 			},
 		)
 		if err != nil {
@@ -243,4 +252,40 @@ func resolveRuntimeInstanceId(
 	}
 
 	return defaultRuntime.ID, nil
+}
+
+// instanceOverlay decrypts the instance's env vars and renders them as the
+// Kustomize overlay for its workload instance. It returns nil when the
+// instance has none.
+func instanceOverlay(
+	r *controller.Reconciler,
+	djangoDefinition *v0.DjangoDefinition,
+	djangoInstance *v0.DjangoInstance,
+) (*string, error) {
+	var env []string
+	if djangoInstance.Env != nil {
+		decrypted, err := encryption.DecryptEnvSlice(*djangoInstance.Env, r.EncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt django instance env: %w", err)
+		}
+		env = decrypted
+	}
+	var secretEnvVars []v0.DjangoSecretEnvVar
+	if djangoInstance.SecretEnvVars != nil {
+		secretEnvVars = *djangoInstance.SecretEnvVars
+	}
+
+	runMigrations := true
+	if djangoDefinition.RunMigrations != nil {
+		runMigrations = *djangoDefinition.RunMigrations
+	}
+
+	overlay, err := djangoInstanceKustomizeOverlay(
+		*djangoDefinition.Name, runMigrations, env, secretEnvVars,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to render django instance env overlay: %w", err)
+	}
+
+	return overlay, nil
 }

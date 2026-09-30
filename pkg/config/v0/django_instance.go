@@ -46,6 +46,15 @@ type DjangoInstanceValues struct {
 
 	DjangoDefinition *DjangoDefinitionValues
 
+	// Literal environment variables as KEY=VALUE entries for this instance
+	// only. A name also set on the definition overrides it. Stored encrypted.
+	// Applied when the instance is created.
+	Env *[]string
+
+	// Environment variables sourced from existing Kubernetes secrets for this
+	// instance only. Overrides same-named variables on the definition.
+	SecretEnvVars []DjangoSecretEnvVarValues
+
 	Age *string
 }
 
@@ -55,6 +64,7 @@ type DjangoInstanceValues struct {
 func (d *DjangoInstanceConfig) Get(
 	apiClient *http.Client,
 	apiEndpoint string,
+	encryptionKey string,
 ) (*[]DjangoInstanceConfig, error) {
 	djangoInstanceValues := d.DjangoInstance
 
@@ -85,6 +95,13 @@ func (d *DjangoInstanceConfig) Get(
 
 	var djangoInstanceConfigs []DjangoInstanceConfig
 	for _, djangoInstance := range *djangoInstances {
+		// literal env values are encrypted at rest: decrypt when the caller
+		// supplied the key, redact otherwise
+		djangoInstance, err := decryptOrRedactInstance(djangoInstance, encryptionKey)
+		if err != nil {
+			return nil, err
+		}
+
 		// the runtime and definition are foreign keys on the API object; the
 		// config abstraction exists so the user sees names instead
 		var kubernetesRuntimeInstanceValues *tpconfig_v0.KubernetesRuntimeInstanceValues
@@ -137,6 +154,8 @@ func (d *DjangoInstanceConfig) Get(
 				KubernetesRuntimeInstance: kubernetesRuntimeInstanceValues,
 				SubDomain:                 djangoInstance.SubDomain,
 				DjangoDefinition:          djangoDefinitionValues,
+				Env:                       djangoInstance.Env,
+				SecretEnvVars:             secretEnvVarsFromAPI(djangoInstance.SecretEnvVars),
 				Age:                       util.Ptr(util.GetAgeFormatted(djangoInstance.CreatedAt)),
 			},
 		}
@@ -191,6 +210,8 @@ func (d *DjangoInstanceConfig) Create(
 		KubernetesRuntimeInstanceID: kubernetesRuntimeInstance.ID,
 		SubDomain:                   djangoInstanceValues.SubDomain,
 		DjangoDefinitionID:          djangoDefinition.ID,
+		Env:                         djangoInstanceValues.Env,
+		SecretEnvVars:               secretEnvVarsToAPI(djangoInstanceValues.SecretEnvVars),
 	}
 
 	// create django instance
@@ -211,6 +232,8 @@ func (d *DjangoInstanceConfig) Create(
 				Name: kubernetesRuntimeInstance.Name,
 			},
 			SubDomain:        createdDjangoInstance.SubDomain,
+			Env:              createdDjangoInstance.Env,
+			SecretEnvVars:    secretEnvVarsFromAPI(createdDjangoInstance.SecretEnvVars),
 			DjangoDefinition: &DjangoDefinitionValues{Name: djangoDefinition.Name},
 			Age:              util.Ptr(util.GetAgeFormatted(createdDjangoInstance.CreatedAt)),
 		},
@@ -277,6 +300,18 @@ func (d *DjangoInstanceConfig) Replace(
 		)
 	}
 
+	// the environment is rendered into the workload instance once, at
+	// creation, so a replace cannot change it
+	if err := checkEnvUnchanged(
+		"django instance",
+		djangoInstanceValues.Env,
+		djangoInstanceValues.SecretEnvVars,
+		existingDjangoInstance.Env,
+		existingDjangoInstance.SecretEnvVars,
+	); err != nil {
+		return nil, err
+	}
+
 	// construct updated django instance object. This is a full replacement, so
 	// every field the user can set is sent rather than merged onto the existing
 	// object.
@@ -290,6 +325,11 @@ func (d *DjangoInstanceConfig) Replace(
 		KubernetesRuntimeInstanceID: kubernetesRuntimeInstance.ID,
 		SubDomain:                   djangoInstanceValues.SubDomain,
 		DjangoDefinitionID:          djangoDefinition.ID,
+
+		// carried over as stored: the values are ciphertext, which the API
+		// recognises and does not encrypt again
+		Env:           existingDjangoInstance.Env,
+		SecretEnvVars: existingDjangoInstance.SecretEnvVars,
 
 		// the workload instance is an owned relationship the reconciler sets,
 		// not something the user configures. A replacement that left it out
@@ -316,6 +356,8 @@ func (d *DjangoInstanceConfig) Replace(
 				Name: kubernetesRuntimeInstance.Name,
 			},
 			SubDomain:        replacedDjangoInstance.SubDomain,
+			Env:              replacedDjangoInstance.Env,
+			SecretEnvVars:    secretEnvVarsFromAPI(replacedDjangoInstance.SecretEnvVars),
 			DjangoDefinition: &DjangoDefinitionValues{Name: djangoDefinition.Name},
 			Age:              util.Ptr(util.GetAgeFormatted(replacedDjangoInstance.CreatedAt)),
 		},
@@ -408,6 +450,10 @@ func (d *DjangoInstanceConfig) Validate() error {
 	// dereferences the name to look it up
 	if djangoInstanceValues.DjangoDefinition == nil || djangoInstanceValues.DjangoDefinition.Name == nil {
 		multiError.AppendError(errors.New("missing required field in config: DjangoDefinition.Name"))
+	}
+
+	if err := validateEnvVars(djangoInstanceValues.Env, djangoInstanceValues.SecretEnvVars); err != nil {
+		multiError.AppendError(err)
 	}
 
 	return multiError.Error()

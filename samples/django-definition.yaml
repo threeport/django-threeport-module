@@ -12,3 +12,14 @@ DjangoDefinition:
   # django-admin migrate runs before the application is made available;
   # defaults to true
   RunMigrations: true
+  # Extra environment variables for every instance of this definition. Env
+  # entries are KEY=VALUE and stored encrypted; SecretEnvVars read a key from an
+  # existing Kubernetes secret. A name may appear once. These are applied when
+  # the definition is created and cannot be changed by a replace.
+  #
+  #   Env:
+  #     - FEATURE_X=off
+  #   SecretEnvVars:
+  #     - Name: DB_PASSWORD
+  #       SecretName: myapp-db          # the secret the module generates
+  #       SecretKey: POSTGRES_PASSWORD
