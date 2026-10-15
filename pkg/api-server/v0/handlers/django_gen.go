@@ -7,7 +7,6 @@ import (
 	api_v0 "django-threeport-module/pkg/api/v0"
 	"errors"
 	"fmt"
-	crdbgorm "github.com/cockroachdb/cockroach-go/v2/crdb/crdbgorm"
 	echo "github.com/labstack/echo/v4"
 	tpapiserver_lib "github.com/threeport/threeport/pkg/api-server/lib/v0"
 	tphandlers_v0 "github.com/threeport/threeport/pkg/api-server/v0/handlers"
@@ -42,70 +41,61 @@ func (h Handler) GetDjangoDefinitionVersions(c echo.Context) error {
 // @Param djangoDefinition body api_v0.DjangoDefinition true "DjangoDefinition object"
 // @Success 201 {object} v0.Response "Created"
 // @Failure 400 {object} v0.Response "Bad Request"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions [POST]
 func (h Handler) AddDjangoDefinition(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 	var djangoDefinition api_v0.DjangoDefinition
 
 	// check for empty payload, unsupported fields, GORM Model fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, false, objectType, djangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	if err := c.Bind(&djangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error binding object", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
 	// check for missing required fields
 	if id, err := tpapiserver_lib.ValidateBoundData(c, djangoDefinition, objectType); err != nil {
 		h.Handler.Logger.Error("handler error: error validating bound data", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
-	// the create runs inside a retryable transaction. Under
-	// SERIALIZABLE isolation CockroachDB answers a write conflict with
-	// SQLSTATE 40001 and expects the client to re-run the transaction.
-	// the duplicate-name read joins it: a restart has to re-check the
-	// name, and checking outside the transaction leaves a window where
-	// two concurrent creates both find the name free.
-	nameUsed := false
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			// the database assigns the primary key, so a retried attempt
-			// must not carry the one a rolled-back attempt was given
-			djangoDefinition.ID = nil
-			nameUsed = true
-			var existingDjangoDefinition api_v0.DjangoDefinition
-			if result := tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Where("name = ?", djangoDefinition.Name).First(&existingDjangoDefinition); result.Error != nil {
-				if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
-					return result.Error
-				}
-				nameUsed = false
-			}
-			// the name is taken; leave the transaction without writing
-			// and let the caller answer 409
-			if nameUsed {
-				return nil
-			}
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Create(&djangoDefinition).Error
-		},
-	); err != nil {
-		h.Handler.Logger.Error("handler error: error creating object", zap.Error(err))
+	// persist to DB
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		// clear id so a retried create does not reuse a rolled-back key
+		djangoDefinition.ID = nil
+		return db.Create(&djangoDefinition)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error creating object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoDefinition),
+			fullyQualifiedType,
+		)
 	}
-	if nameUsed {
-		return tpapiserver_lib.ResponseStatus409(c, nil, errors.New("object with provided name already exists"), objectType)
+
+	// the write has committed; bring any process state that mirrors the
+	// database in line before answering, so a caller that gets a 200 can
+	// rely on it. A persist hook cannot do this: it runs inside the
+	// transaction, so it would act on a write that may never commit.
+	if err := tpapiserver_lib.AfterCommitCreate(h.Handler.DB, &djangoDefinition); err != nil {
+		h.Handler.Logger.Error("handler error: error reconciling process state after commit", zap.Error(err))
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	// notify controller if reconciliation is required
@@ -117,7 +107,7 @@ func (h Handler) AddDjangoDefinition(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoDefinitionCreateSubject, *notifPayload)
 	}
@@ -125,11 +115,11 @@ func (h Handler) AddDjangoDefinition(c echo.Context) error {
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoDefinition,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus201(c, *response)
@@ -146,19 +136,19 @@ func (h Handler) AddDjangoDefinition(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions [GET]
 func (h Handler) GetDjangoDefinitions(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 
 	// get pagination parameters
 	pageParams, err := c.(*tpapiserver_lib.CustomContext).GetPaginationParams()
 	if err != nil {
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 	}
 
 	// bind filter
 	var filter api_v0.DjangoDefinition
 	if err := c.Bind(&filter); err != nil {
 		h.Handler.Logger.Error("handler error: error binding filter", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 	}
 
 	pagination := new(tpapiserver_lib.Pagination)
@@ -174,7 +164,7 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 		var totalCount int64
 		if result := h.Handler.RequestDB(c).Model(&api_v0.DjangoDefinition{}).Where(&filter).Count(&totalCount); result.Error != nil {
 			h.Handler.Logger.Error("handler error: error counting objects", zap.Error(result.Error))
-			return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, fullyQualifiedType)
 		}
 
 		// see if total count is greater than the limit
@@ -185,7 +175,7 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 			// if we don't have to paginate, return all records
 			if result := h.Handler.RequestDB(c).Order("ID asc").Where(&filter).Find(records); result.Error != nil {
 				h.Handler.Logger.Error("handler error: error finding objects", zap.Error(result.Error))
-				return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, fullyQualifiedType)
 			}
 			returnedCount = int64(len(*records))
 		case true:
@@ -194,10 +184,10 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 			queryId, count, err := h.Handler.DispatchGetPaginatedRecords(h.Handler.RequestDB(c).Model(&api_v0.DjangoDefinition{}).Where(&filter), records, queryTable, pageParams)
 			if err != nil {
 				if errors.Is(err, tpapiserver_lib.ErrInvalidPaginationQueryId) || errors.Is(err, tpapiserver_lib.ErrPaginationSessionExpired) {
-					return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+					return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 				}
 				h.Handler.Logger.Error("handler error: error fetching paginated records", zap.Error(err))
-				return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 			}
 			pagination.QueryId = queryId
 			returnedCount = count
@@ -211,17 +201,17 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 		}
 	case pageParams.QueryId != "" && pageParams.Cursor == 0:
 		// client provided a query ID but no cursor, so we cannot fetch the next page of results
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, errors.New("cursor is required when query ID is provided"), objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, errors.New("cursor is required when query ID is provided"), fullyQualifiedType)
 	case pageParams.QueryId != "" && pageParams.Cursor != 0:
 		// continuation: dispatch to the configured pagination strategy to fetch the next page
 		queryTable := filter.TableName()
 		queryId, count, err := h.Handler.DispatchGetPaginatedRecords(h.Handler.RequestDB(c).Model(&api_v0.DjangoDefinition{}).Where(&filter), records, queryTable, pageParams)
 		if err != nil {
 			if errors.Is(err, tpapiserver_lib.ErrInvalidPaginationQueryId) || errors.Is(err, tpapiserver_lib.ErrPaginationSessionExpired) {
-				return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+				return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 			}
 			h.Handler.Logger.Error("handler error: error fetching paginated records", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 		}
 		pagination.QueryId = queryId
 		returnedCount = count
@@ -244,11 +234,11 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 			Pagination:  *pagination,
 		},
 		*records,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -265,26 +255,26 @@ func (h Handler) GetDjangoDefinitions(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions/{id} [GET]
 func (h Handler) GetDjangoDefinition(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 	djangoDefinitionID := c.Param("id")
 	var djangoDefinition api_v0.DjangoDefinition
 	if result := h.Handler.RequestDB(c).
 		First(&djangoDefinition, djangoDefinitionID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoDefinition,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -304,58 +294,63 @@ func (h Handler) GetDjangoDefinition(c echo.Context) error {
 // @Success 200 {object} v0.Response "OK"
 // @Failure 400 {object} v0.Response "Bad Request"
 // @Failure 404 {object} v0.Response "Not Found"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions/{id} [PATCH]
 func (h Handler) UpdateDjangoDefinition(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 	djangoDefinitionID := c.Param("id")
 	var existingDjangoDefinition api_v0.DjangoDefinition
+	if result := h.Handler.RequestDB(c).First(&existingDjangoDefinition, djangoDefinitionID); result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
+		}
+		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
+	}
+
 	// check for empty payload, invalid or unsupported fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, true, objectType, existingDjangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	// bind payload
 	var updatedDjangoDefinition api_v0.DjangoDefinition
 	if err := c.Bind(&updatedDjangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error binding payload", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
-	// the read and the write retry together. Under SERIALIZABLE
-	// isolation CockroachDB answers a conflict with SQLSTATE 40001 and
-	// expects the client to re-run the transaction; a restart that
-	// re-ran only the write would land it on a stale row. RequestDB is
-	// not used because ExecuteTx opens the transaction itself, so the
-	// query scopes it would have applied go on tx instead.
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			// a retried attempt must not read into the previous one's leftovers
-			existingDjangoDefinition = api_v0.DjangoDefinition{}
-			if result := tx.Scopes(tpapiserver_lib.QueryScopes(c)...).First(&existingDjangoDefinition, djangoDefinitionID); result.Error != nil {
-				return result.Error
-			}
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Model(&existingDjangoDefinition).Updates(&updatedDjangoDefinition).Error
-		},
-	); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, err, objectType)
-		}
-		h.Handler.Logger.Error("handler error: error updating object", zap.Error(err))
+	// snapshot reconciliation state before update so the notify block
+	// can skip publishing when the update did not touch any state marker
+	prevReconciliation := existingDjangoDefinition.Reconciliation
+
+	// update object in database
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		return db.Model(&existingDjangoDefinition).Updates(&updatedDjangoDefinition)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error updating object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoDefinition),
+			fullyQualifiedType,
+		)
 	}
 
-	// notify controller if reconciliation is required
-	if !*existingDjangoDefinition.Reconciled {
+	// notify controller if reconciliation is required and the update is notifiable
+	if existingDjangoDefinition.Reconciled != nil && !*existingDjangoDefinition.Reconciled &&
+		tpapi_v0.ReconciliationUpdateNotifiable(prevReconciliation, existingDjangoDefinition.Reconciliation) {
 		notifPayload, err := existingDjangoDefinition.NotificationPayload(
 			notifications.NotificationOperationUpdated,
 			false,
@@ -363,7 +358,7 @@ func (h Handler) UpdateDjangoDefinition(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoDefinitionUpdateSubject, *notifPayload)
 	}
@@ -371,11 +366,11 @@ func (h Handler) UpdateDjangoDefinition(c echo.Context) error {
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		existingDjangoDefinition,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -396,80 +391,99 @@ func (h Handler) UpdateDjangoDefinition(c echo.Context) error {
 // @Success 200 {object} v0.Response "OK"
 // @Failure 400 {object} v0.Response "Bad Request"
 // @Failure 404 {object} v0.Response "Not Found"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions/{id} [PUT]
 func (h Handler) ReplaceDjangoDefinition(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 	djangoDefinitionID := c.Param("id")
 	var existingDjangoDefinition api_v0.DjangoDefinition
 	if result := h.Handler.RequestDB(c).First(&existingDjangoDefinition, djangoDefinitionID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	// check for empty payload, invalid or unsupported fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, true, objectType, existingDjangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	// bind payload
 	var updatedDjangoDefinition api_v0.DjangoDefinition
 	if err := c.Bind(&updatedDjangoDefinition); err != nil {
 		h.Handler.Logger.Error("handler error: error binding payload", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
 	// check for missing required fields
 	if id, err := tpapiserver_lib.ValidateBoundData(c, updatedDjangoDefinition, objectType); err != nil {
 		h.Handler.Logger.Error("handler error: error validating bound data", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
+
+	// snapshot reconciliation state before replace so the notify block
+	// can skip publishing when the replace did not touch any state marker
+	prevReconciliation := existingDjangoDefinition.Reconciliation
 
 	// persist provided data
 	updatedDjangoDefinition.ID = existingDjangoDefinition.ID
-	// the save runs inside a retryable transaction. Under SERIALIZABLE
-	// isolation CockroachDB answers a write conflict with SQLSTATE 40001
-	// and expects the client to re-run it. Only the write is retried: the
-	// read above contributes the primary key, which the URL fixes, so it
-	// cannot go stale between attempts.
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Session(&gorm.Session{FullSaveAssociations: false}).Omit("CreatedAt", "DeletedAt").Save(&updatedDjangoDefinition).Error
-		},
-	); err != nil {
-		h.Handler.Logger.Error("handler error: error persisting object", zap.Error(err))
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		return db.Session(&gorm.Session{FullSaveAssociations: false}).Omit("CreatedAt", "DeletedAt").Save(&updatedDjangoDefinition)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error persisting object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoDefinition),
+			fullyQualifiedType,
+		)
 	}
 
 	// reload updated data from DB
 	if result := h.Handler.RequestDB(c).First(&existingDjangoDefinition, djangoDefinitionID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
+	}
+
+	// notify controller if reconciliation is required and the update is notifiable
+	if existingDjangoDefinition.Reconciled != nil && !*existingDjangoDefinition.Reconciled &&
+		tpapi_v0.ReconciliationUpdateNotifiable(prevReconciliation, existingDjangoDefinition.Reconciliation) {
+		notifPayload, err := existingDjangoDefinition.NotificationPayload(
+			notifications.NotificationOperationUpdated,
+			false,
+			time.Now().Unix(),
+		)
+		if err != nil {
+			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
+		}
+		h.Handler.JS.Publish(notif.DjangoDefinitionUpdateSubject, *notifPayload)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		existingDjangoDefinition,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -487,21 +501,21 @@ func (h Handler) ReplaceDjangoDefinition(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-definitions/{id} [DELETE]
 func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoDefinition
+	fullyQualifiedType := new(api_v0.DjangoDefinition).GetFullyQualifiedType()
 	djangoDefinitionID := c.Param("id")
 	var djangoDefinition api_v0.DjangoDefinition
 	if result := h.Handler.RequestDB(c).Preload("DjangoInstances").First(&djangoDefinition, djangoDefinitionID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	// check to make sure no dependent instances exist for this definition
 	if len(djangoDefinition.DjangoInstances) != 0 {
-		err := errors.New("django definition has related django instances - cannot be deleted")
-		return tpapiserver_lib.ResponseStatus409(c, nil, err, objectType)
+		err := errors.New("django definition has related django instances - " + tpapi_v0.ErrMsgDeleteBlocked)
+		return tpapiserver_lib.ResponseStatus409(c, nil, err, fullyQualifiedType)
 	}
 
 	// pre-check synchronously so the client sees the 409 - without this, reconciled types only surface the block to the reconciler
@@ -514,7 +528,7 @@ func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
 				blockedErr,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, checkErr, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, checkErr, fullyQualifiedType)
 	}
 	// schedule for deletion if not already scheduled
 	// if scheduled and reconciled, delete object from DB
@@ -528,14 +542,11 @@ func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
 				DeletionScheduled: &timestamp,
 				Reconciled:        &reconciled,
 			}}
-		if err := crdbgorm.ExecuteTx(
-			c.Request().Context(), h.Handler.DB, nil,
-			func(tx *gorm.DB) error {
-				return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Model(&djangoDefinition).Updates(&scheduledDjangoDefinition).Error
-			},
-		); err != nil {
-			h.Handler.Logger.Error("handler error: error creating scheduled deletion", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+			return db.Model(&djangoDefinition).Updates(&scheduledDjangoDefinition)
+		}); result.Error != nil {
+			h.Handler.Logger.Error("handler error: error creating scheduled deletion", zap.Error(result.Error))
+			return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 		}
 		// notify controller
 		notifPayload, err := djangoDefinition.NotificationPayload(
@@ -545,7 +556,7 @@ func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoDefinitionDeleteSubject, *notifPayload)
 	} else {
@@ -553,22 +564,20 @@ func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
 			// if deletion scheduled but not reconciled, return 409 - deletion
 			// already underway
 			return tpapiserver_lib.ResponseStatus409(c, nil, errors.New(fmt.Sprintf(
-				"object with ID %d already being deleted",
+				"object with ID %d %s",
 				*djangoDefinition.ID,
-			)), objectType)
+				tpapi_v0.ErrMsgAlreadyBeingDeleted,
+			)), fullyQualifiedType)
 		} else {
 			// object scheduled for deletion and confirmed - it can be deleted
 			// from DB
-			if err := crdbgorm.ExecuteTx(
-				c.Request().Context(), h.Handler.DB, nil,
-				func(tx *gorm.DB) error {
-					return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Delete(&djangoDefinition).Error
-				},
-			); err != nil {
-				h.Handler.Logger.Error("handler error: error deleting object", zap.Error(err))
+			if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+				return db.Delete(&djangoDefinition)
+			}); result.Error != nil {
+				h.Handler.Logger.Error("handler error: error deleting object", zap.Error(result.Error))
 				// surface BlockedDeleteError from gorm hook - backstop in case an attached object reference was created after the pre-check
 				var blockedErr *tpapi_v0.BlockedDeleteError
-				if errors.As(err, &blockedErr) {
+				if errors.As(result.Error, &blockedErr) {
 					return tphandlers_v0.RespondBlockedDelete(
 						c,
 						h.Handler.RequestDB(c),
@@ -577,24 +586,32 @@ func (h Handler) DeleteDjangoDefinition(c echo.Context) error {
 				}
 				// check if this is a custom HTTP error with specific status code
 				var httpErr *tputil_v0.HttpError
-				if errors.As(err, &httpErr) {
+				if errors.As(result.Error, &httpErr) {
 					return tpapiserver_lib.ResponseStatusErr(
-						httpErr.GetStatusCode(), c, nil, err, objectType,
+						httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 					)
 				}
-				return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 			}
 		}
+	}
+
+	// the delete has committed; drop any process state that mirrored the
+	// row before answering. A persist hook cannot do this: a rollback
+	// would have dropped state for a row that survived.
+	if err := tpapiserver_lib.AfterCommitDelete(h.Handler.DB, &djangoDefinition); err != nil {
+		h.Handler.Logger.Error("handler error: error reconciling process state after commit", zap.Error(err))
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoDefinition,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -622,70 +639,61 @@ func (h Handler) GetDjangoInstanceVersions(c echo.Context) error {
 // @Param djangoInstance body api_v0.DjangoInstance true "DjangoInstance object"
 // @Success 201 {object} v0.Response "Created"
 // @Failure 400 {object} v0.Response "Bad Request"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances [POST]
 func (h Handler) AddDjangoInstance(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 	var djangoInstance api_v0.DjangoInstance
 
 	// check for empty payload, unsupported fields, GORM Model fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, false, objectType, djangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	if err := c.Bind(&djangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error binding object", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
 	// check for missing required fields
 	if id, err := tpapiserver_lib.ValidateBoundData(c, djangoInstance, objectType); err != nil {
 		h.Handler.Logger.Error("handler error: error validating bound data", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
-	// the create runs inside a retryable transaction. Under
-	// SERIALIZABLE isolation CockroachDB answers a write conflict with
-	// SQLSTATE 40001 and expects the client to re-run the transaction.
-	// the duplicate-name read joins it: a restart has to re-check the
-	// name, and checking outside the transaction leaves a window where
-	// two concurrent creates both find the name free.
-	nameUsed := false
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			// the database assigns the primary key, so a retried attempt
-			// must not carry the one a rolled-back attempt was given
-			djangoInstance.ID = nil
-			nameUsed = true
-			var existingDjangoInstance api_v0.DjangoInstance
-			if result := tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Where("name = ?", djangoInstance.Name).First(&existingDjangoInstance); result.Error != nil {
-				if !errors.Is(result.Error, gorm.ErrRecordNotFound) {
-					return result.Error
-				}
-				nameUsed = false
-			}
-			// the name is taken; leave the transaction without writing
-			// and let the caller answer 409
-			if nameUsed {
-				return nil
-			}
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Create(&djangoInstance).Error
-		},
-	); err != nil {
-		h.Handler.Logger.Error("handler error: error creating object", zap.Error(err))
+	// persist to DB
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		// clear id so a retried create does not reuse a rolled-back key
+		djangoInstance.ID = nil
+		return db.Create(&djangoInstance)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error creating object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoInstance),
+			fullyQualifiedType,
+		)
 	}
-	if nameUsed {
-		return tpapiserver_lib.ResponseStatus409(c, nil, errors.New("object with provided name already exists"), objectType)
+
+	// the write has committed; bring any process state that mirrors the
+	// database in line before answering, so a caller that gets a 200 can
+	// rely on it. A persist hook cannot do this: it runs inside the
+	// transaction, so it would act on a write that may never commit.
+	if err := tpapiserver_lib.AfterCommitCreate(h.Handler.DB, &djangoInstance); err != nil {
+		h.Handler.Logger.Error("handler error: error reconciling process state after commit", zap.Error(err))
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	// notify controller if reconciliation is required
@@ -697,7 +705,7 @@ func (h Handler) AddDjangoInstance(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoInstanceCreateSubject, *notifPayload)
 	}
@@ -705,11 +713,11 @@ func (h Handler) AddDjangoInstance(c echo.Context) error {
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoInstance,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus201(c, *response)
@@ -726,19 +734,19 @@ func (h Handler) AddDjangoInstance(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances [GET]
 func (h Handler) GetDjangoInstances(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 
 	// get pagination parameters
 	pageParams, err := c.(*tpapiserver_lib.CustomContext).GetPaginationParams()
 	if err != nil {
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 	}
 
 	// bind filter
 	var filter api_v0.DjangoInstance
 	if err := c.Bind(&filter); err != nil {
 		h.Handler.Logger.Error("handler error: error binding filter", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 	}
 
 	pagination := new(tpapiserver_lib.Pagination)
@@ -754,7 +762,7 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 		var totalCount int64
 		if result := h.Handler.RequestDB(c).Model(&api_v0.DjangoInstance{}).Where(&filter).Count(&totalCount); result.Error != nil {
 			h.Handler.Logger.Error("handler error: error counting objects", zap.Error(result.Error))
-			return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, fullyQualifiedType)
 		}
 
 		// see if total count is greater than the limit
@@ -765,7 +773,7 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 			// if we don't have to paginate, return all records
 			if result := h.Handler.RequestDB(c).Order("ID asc").Where(&filter).Find(records); result.Error != nil {
 				h.Handler.Logger.Error("handler error: error finding objects", zap.Error(result.Error))
-				return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, pageParams, result.Error, fullyQualifiedType)
 			}
 			returnedCount = int64(len(*records))
 		case true:
@@ -774,10 +782,10 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 			queryId, count, err := h.Handler.DispatchGetPaginatedRecords(h.Handler.RequestDB(c).Model(&api_v0.DjangoInstance{}).Where(&filter), records, queryTable, pageParams)
 			if err != nil {
 				if errors.Is(err, tpapiserver_lib.ErrInvalidPaginationQueryId) || errors.Is(err, tpapiserver_lib.ErrPaginationSessionExpired) {
-					return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+					return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 				}
 				h.Handler.Logger.Error("handler error: error fetching paginated records", zap.Error(err))
-				return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 			}
 			pagination.QueryId = queryId
 			returnedCount = count
@@ -791,17 +799,17 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 		}
 	case pageParams.QueryId != "" && pageParams.Cursor == 0:
 		// client provided a query ID but no cursor, so we cannot fetch the next page of results
-		return tpapiserver_lib.ResponseStatus400(c, pageParams, errors.New("cursor is required when query ID is provided"), objectType)
+		return tpapiserver_lib.ResponseStatus400(c, pageParams, errors.New("cursor is required when query ID is provided"), fullyQualifiedType)
 	case pageParams.QueryId != "" && pageParams.Cursor != 0:
 		// continuation: dispatch to the configured pagination strategy to fetch the next page
 		queryTable := filter.TableName()
 		queryId, count, err := h.Handler.DispatchGetPaginatedRecords(h.Handler.RequestDB(c).Model(&api_v0.DjangoInstance{}).Where(&filter), records, queryTable, pageParams)
 		if err != nil {
 			if errors.Is(err, tpapiserver_lib.ErrInvalidPaginationQueryId) || errors.Is(err, tpapiserver_lib.ErrPaginationSessionExpired) {
-				return tpapiserver_lib.ResponseStatus400(c, pageParams, err, objectType)
+				return tpapiserver_lib.ResponseStatus400(c, pageParams, err, fullyQualifiedType)
 			}
 			h.Handler.Logger.Error("handler error: error fetching paginated records", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 		}
 		pagination.QueryId = queryId
 		returnedCount = count
@@ -824,11 +832,11 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 			Pagination:  *pagination,
 		},
 		*records,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, pageParams, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, pageParams, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -845,26 +853,26 @@ func (h Handler) GetDjangoInstances(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances/{id} [GET]
 func (h Handler) GetDjangoInstance(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 	djangoInstanceID := c.Param("id")
 	var djangoInstance api_v0.DjangoInstance
 	if result := h.Handler.RequestDB(c).
 		First(&djangoInstance, djangoInstanceID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoInstance,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -884,58 +892,63 @@ func (h Handler) GetDjangoInstance(c echo.Context) error {
 // @Success 200 {object} v0.Response "OK"
 // @Failure 400 {object} v0.Response "Bad Request"
 // @Failure 404 {object} v0.Response "Not Found"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances/{id} [PATCH]
 func (h Handler) UpdateDjangoInstance(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 	djangoInstanceID := c.Param("id")
 	var existingDjangoInstance api_v0.DjangoInstance
+	if result := h.Handler.RequestDB(c).First(&existingDjangoInstance, djangoInstanceID); result.Error != nil {
+		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
+		}
+		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
+	}
+
 	// check for empty payload, invalid or unsupported fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, true, objectType, existingDjangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	// bind payload
 	var updatedDjangoInstance api_v0.DjangoInstance
 	if err := c.Bind(&updatedDjangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error binding payload", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
-	// the read and the write retry together. Under SERIALIZABLE
-	// isolation CockroachDB answers a conflict with SQLSTATE 40001 and
-	// expects the client to re-run the transaction; a restart that
-	// re-ran only the write would land it on a stale row. RequestDB is
-	// not used because ExecuteTx opens the transaction itself, so the
-	// query scopes it would have applied go on tx instead.
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			// a retried attempt must not read into the previous one's leftovers
-			existingDjangoInstance = api_v0.DjangoInstance{}
-			if result := tx.Scopes(tpapiserver_lib.QueryScopes(c)...).First(&existingDjangoInstance, djangoInstanceID); result.Error != nil {
-				return result.Error
-			}
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Model(&existingDjangoInstance).Updates(&updatedDjangoInstance).Error
-		},
-	); err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, err, objectType)
-		}
-		h.Handler.Logger.Error("handler error: error updating object", zap.Error(err))
+	// snapshot reconciliation state before update so the notify block
+	// can skip publishing when the update did not touch any state marker
+	prevReconciliation := existingDjangoInstance.Reconciliation
+
+	// update object in database
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		return db.Model(&existingDjangoInstance).Updates(&updatedDjangoInstance)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error updating object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoInstance),
+			fullyQualifiedType,
+		)
 	}
 
-	// notify controller if reconciliation is required
-	if !*existingDjangoInstance.Reconciled {
+	// notify controller if reconciliation is required and the update is notifiable
+	if existingDjangoInstance.Reconciled != nil && !*existingDjangoInstance.Reconciled &&
+		tpapi_v0.ReconciliationUpdateNotifiable(prevReconciliation, existingDjangoInstance.Reconciliation) {
 		notifPayload, err := existingDjangoInstance.NotificationPayload(
 			notifications.NotificationOperationUpdated,
 			false,
@@ -943,7 +956,7 @@ func (h Handler) UpdateDjangoInstance(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoInstanceUpdateSubject, *notifPayload)
 	}
@@ -951,11 +964,11 @@ func (h Handler) UpdateDjangoInstance(c echo.Context) error {
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		existingDjangoInstance,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -976,80 +989,99 @@ func (h Handler) UpdateDjangoInstance(c echo.Context) error {
 // @Success 200 {object} v0.Response "OK"
 // @Failure 400 {object} v0.Response "Bad Request"
 // @Failure 404 {object} v0.Response "Not Found"
+// @Failure 409 {object} v0.Response "Conflict"
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances/{id} [PUT]
 func (h Handler) ReplaceDjangoInstance(c echo.Context) error {
 	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 	djangoInstanceID := c.Param("id")
 	var existingDjangoInstance api_v0.DjangoInstance
 	if result := h.Handler.RequestDB(c).First(&existingDjangoInstance, djangoInstanceID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	// check for empty payload, invalid or unsupported fields, optional associations, etc.
 	if id, err := tpapiserver_lib.PayloadCheck(c, true, true, objectType, existingDjangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error performing payload check", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
 
 	// bind payload
 	var updatedDjangoInstance api_v0.DjangoInstance
 	if err := c.Bind(&updatedDjangoInstance); err != nil {
 		h.Handler.Logger.Error("handler error: error binding payload", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatusBindErr(c, nil, err, fullyQualifiedType)
 	}
 
 	// check for missing required fields
 	if id, err := tpapiserver_lib.ValidateBoundData(c, updatedDjangoInstance, objectType); err != nil {
 		h.Handler.Logger.Error("handler error: error validating bound data", zap.Error(err))
-		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), objectType)
+		return tpapiserver_lib.ResponseStatusErr(id, c, nil, errors.New(err.Error()), fullyQualifiedType)
 	}
+
+	// snapshot reconciliation state before replace so the notify block
+	// can skip publishing when the replace did not touch any state marker
+	prevReconciliation := existingDjangoInstance.Reconciliation
 
 	// persist provided data
 	updatedDjangoInstance.ID = existingDjangoInstance.ID
-	// the save runs inside a retryable transaction. Under SERIALIZABLE
-	// isolation CockroachDB answers a write conflict with SQLSTATE 40001
-	// and expects the client to re-run it. Only the write is retried: the
-	// read above contributes the primary key, which the URL fixes, so it
-	// cannot go stale between attempts.
-	if err := crdbgorm.ExecuteTx(
-		c.Request().Context(), h.Handler.DB, nil,
-		func(tx *gorm.DB) error {
-			return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Session(&gorm.Session{FullSaveAssociations: false}).Omit("CreatedAt", "DeletedAt").Save(&updatedDjangoInstance).Error
-		},
-	); err != nil {
-		h.Handler.Logger.Error("handler error: error persisting object", zap.Error(err))
+	if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+		return db.Session(&gorm.Session{FullSaveAssociations: false}).Omit("CreatedAt", "DeletedAt").Save(&updatedDjangoInstance)
+	}); result.Error != nil {
+		h.Handler.Logger.Error("handler error: error persisting object", zap.Error(result.Error))
 		// check if this is a custom HTTP error with specific status code
 		var httpErr *tputil_v0.HttpError
-		if errors.As(err, &httpErr) {
+		if errors.As(result.Error, &httpErr) {
 			return tpapiserver_lib.ResponseStatusErr(
-				httpErr.GetStatusCode(), c, nil, err, objectType,
+				httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.RespondWriteError(
+			c,
+			h.Handler.Logger,
+			result.Error,
+			new(api_v0.DjangoInstance),
+			fullyQualifiedType,
+		)
 	}
 
 	// reload updated data from DB
 	if result := h.Handler.RequestDB(c).First(&existingDjangoInstance, djangoInstanceID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
+	}
+
+	// notify controller if reconciliation is required and the update is notifiable
+	if existingDjangoInstance.Reconciled != nil && !*existingDjangoInstance.Reconciled &&
+		tpapi_v0.ReconciliationUpdateNotifiable(prevReconciliation, existingDjangoInstance.Reconciliation) {
+		notifPayload, err := existingDjangoInstance.NotificationPayload(
+			notifications.NotificationOperationUpdated,
+			false,
+			time.Now().Unix(),
+		)
+		if err != nil {
+			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
+		}
+		h.Handler.JS.Publish(notif.DjangoInstanceUpdateSubject, *notifPayload)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		existingDjangoInstance,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)
@@ -1067,15 +1099,15 @@ func (h Handler) ReplaceDjangoInstance(c echo.Context) error {
 // @Failure 500 {object} v0.Response "Internal Server Error"
 // @Router /threeport-io/v0/django-instances/{id} [DELETE]
 func (h Handler) DeleteDjangoInstance(c echo.Context) error {
-	objectType := api_v0.ObjectTypeDjangoInstance
+	fullyQualifiedType := new(api_v0.DjangoInstance).GetFullyQualifiedType()
 	djangoInstanceID := c.Param("id")
 	var djangoInstance api_v0.DjangoInstance
 	if result := h.Handler.RequestDB(c).First(&djangoInstance, djangoInstanceID); result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, objectType)
+			return tpapiserver_lib.ResponseStatus404(c, nil, result.Error, fullyQualifiedType)
 		}
 		h.Handler.Logger.Error("handler error: error finding object", zap.Error(result.Error))
-		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 	}
 
 	// pre-check synchronously so the client sees the 409 - without this, reconciled types only surface the block to the reconciler
@@ -1088,7 +1120,7 @@ func (h Handler) DeleteDjangoInstance(c echo.Context) error {
 				blockedErr,
 			)
 		}
-		return tpapiserver_lib.ResponseStatus500(c, nil, checkErr, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, checkErr, fullyQualifiedType)
 	}
 	// schedule for deletion if not already scheduled
 	// if scheduled and reconciled, delete object from DB
@@ -1102,14 +1134,11 @@ func (h Handler) DeleteDjangoInstance(c echo.Context) error {
 				DeletionScheduled: &timestamp,
 				Reconciled:        &reconciled,
 			}}
-		if err := crdbgorm.ExecuteTx(
-			c.Request().Context(), h.Handler.DB, nil,
-			func(tx *gorm.DB) error {
-				return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Model(&djangoInstance).Updates(&scheduledDjangoInstance).Error
-			},
-		); err != nil {
-			h.Handler.Logger.Error("handler error: error creating scheduled deletion", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+			return db.Model(&djangoInstance).Updates(&scheduledDjangoInstance)
+		}); result.Error != nil {
+			h.Handler.Logger.Error("handler error: error creating scheduled deletion", zap.Error(result.Error))
+			return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 		}
 		// notify controller
 		notifPayload, err := djangoInstance.NotificationPayload(
@@ -1119,7 +1148,7 @@ func (h Handler) DeleteDjangoInstance(c echo.Context) error {
 		)
 		if err != nil {
 			h.Handler.Logger.Error("handler error: error creating NATS notification", zap.Error(err))
-			return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+			return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 		}
 		h.Handler.JS.Publish(notif.DjangoInstanceDeleteSubject, *notifPayload)
 	} else {
@@ -1127,22 +1156,20 @@ func (h Handler) DeleteDjangoInstance(c echo.Context) error {
 			// if deletion scheduled but not reconciled, return 409 - deletion
 			// already underway
 			return tpapiserver_lib.ResponseStatus409(c, nil, errors.New(fmt.Sprintf(
-				"object with ID %d already being deleted",
+				"object with ID %d %s",
 				*djangoInstance.ID,
-			)), objectType)
+				tpapi_v0.ErrMsgAlreadyBeingDeleted,
+			)), fullyQualifiedType)
 		} else {
 			// object scheduled for deletion and confirmed - it can be deleted
 			// from DB
-			if err := crdbgorm.ExecuteTx(
-				c.Request().Context(), h.Handler.DB, nil,
-				func(tx *gorm.DB) error {
-					return tx.Scopes(tpapiserver_lib.QueryScopes(c)...).Delete(&djangoInstance).Error
-				},
-			); err != nil {
-				h.Handler.Logger.Error("handler error: error deleting object", zap.Error(err))
+			if result := h.Handler.Write(c, func(db *gorm.DB) *gorm.DB {
+				return db.Delete(&djangoInstance)
+			}); result.Error != nil {
+				h.Handler.Logger.Error("handler error: error deleting object", zap.Error(result.Error))
 				// surface BlockedDeleteError from gorm hook - backstop in case an attached object reference was created after the pre-check
 				var blockedErr *tpapi_v0.BlockedDeleteError
-				if errors.As(err, &blockedErr) {
+				if errors.As(result.Error, &blockedErr) {
 					return tphandlers_v0.RespondBlockedDelete(
 						c,
 						h.Handler.RequestDB(c),
@@ -1151,24 +1178,32 @@ func (h Handler) DeleteDjangoInstance(c echo.Context) error {
 				}
 				// check if this is a custom HTTP error with specific status code
 				var httpErr *tputil_v0.HttpError
-				if errors.As(err, &httpErr) {
+				if errors.As(result.Error, &httpErr) {
 					return tpapiserver_lib.ResponseStatusErr(
-						httpErr.GetStatusCode(), c, nil, err, objectType,
+						httpErr.GetStatusCode(), c, nil, result.Error, fullyQualifiedType,
 					)
 				}
-				return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+				return tpapiserver_lib.ResponseStatus500(c, nil, result.Error, fullyQualifiedType)
 			}
 		}
+	}
+
+	// the delete has committed; drop any process state that mirrored the
+	// row before answering. A persist hook cannot do this: a rollback
+	// would have dropped state for a row that survived.
+	if err := tpapiserver_lib.AfterCommitDelete(h.Handler.DB, &djangoInstance); err != nil {
+		h.Handler.Logger.Error("handler error: error reconciling process state after commit", zap.Error(err))
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	response, err := tpapiserver_lib.CreateResponse(
 		tpapiserver_lib.SingleObjectMeta(),
 		djangoInstance,
-		objectType,
+		fullyQualifiedType,
 	)
 	if err != nil {
 		h.Handler.Logger.Error("handler error: error creating response", zap.Error(err))
-		return tpapiserver_lib.ResponseStatus500(c, nil, err, objectType)
+		return tpapiserver_lib.ResponseStatus500(c, nil, err, fullyQualifiedType)
 	}
 
 	return tpapiserver_lib.ResponseStatus200(c, *response)

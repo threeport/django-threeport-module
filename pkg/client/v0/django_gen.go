@@ -6,6 +6,7 @@ import (
 	"bytes"
 	v0 "django-threeport-module/pkg/api/v0"
 	"encoding/json"
+	"errors"
 	"fmt"
 	tpapiserver_lib "github.com/threeport/threeport/pkg/api-server/lib/v0"
 	tpclient_lib "github.com/threeport/threeport/pkg/client/lib/v0"
@@ -77,6 +78,10 @@ func GetDjangoDefinitionByID(apiClient *http.Client, apiAddr string, id uint) (*
 	)
 	if err != nil {
 		return &djangoDefinition, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return &djangoDefinition, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])
@@ -180,6 +185,10 @@ func CreateDjangoDefinition(apiClient *http.Client, apiAddr string, djangoDefini
 		return djangoDefinition, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
 	}
 
+	if len(response.Data) == 0 {
+		return djangoDefinition, errors.New("threeport API returned no object in response data")
+	}
+
 	jsonData, err := json.Marshal(response.Data[0])
 	if err != nil {
 		return djangoDefinition, fmt.Errorf("failed to marshal response data from threeport API: %w", err)
@@ -220,6 +229,10 @@ func UpdateDjangoDefinition(apiClient *http.Client, apiAddr string, djangoDefini
 	)
 	if err != nil {
 		return djangoDefinition, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return djangoDefinition, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])
@@ -265,6 +278,10 @@ func ReplaceDjangoDefinition(apiClient *http.Client, apiAddr string, djangoDefin
 		return djangoDefinition, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
 	}
 
+	if len(response.Data) == 0 {
+		return djangoDefinition, errors.New("threeport API returned no object in response data")
+	}
+
 	jsonData, err := json.Marshal(response.Data[0])
 	if err != nil {
 		return djangoDefinition, fmt.Errorf("failed to marshal response data from threeport API: %w", err)
@@ -294,6 +311,10 @@ func DeleteDjangoDefinition(apiClient *http.Client, apiAddr string, id uint) (*v
 	)
 	if err != nil {
 		return &djangoDefinition, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return &djangoDefinition, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])
@@ -374,6 +395,10 @@ func GetDjangoInstanceByID(apiClient *http.Client, apiAddr string, id uint) (*v0
 	)
 	if err != nil {
 		return &djangoInstance, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return &djangoInstance, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])
@@ -477,6 +502,10 @@ func CreateDjangoInstance(apiClient *http.Client, apiAddr string, djangoInstance
 		return djangoInstance, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
 	}
 
+	if len(response.Data) == 0 {
+		return djangoInstance, errors.New("threeport API returned no object in response data")
+	}
+
 	jsonData, err := json.Marshal(response.Data[0])
 	if err != nil {
 		return djangoInstance, fmt.Errorf("failed to marshal response data from threeport API: %w", err)
@@ -517,6 +546,10 @@ func UpdateDjangoInstance(apiClient *http.Client, apiAddr string, djangoInstance
 	)
 	if err != nil {
 		return djangoInstance, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return djangoInstance, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])
@@ -562,6 +595,10 @@ func ReplaceDjangoInstance(apiClient *http.Client, apiAddr string, djangoInstanc
 		return djangoInstance, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
 	}
 
+	if len(response.Data) == 0 {
+		return djangoInstance, errors.New("threeport API returned no object in response data")
+	}
+
 	jsonData, err := json.Marshal(response.Data[0])
 	if err != nil {
 		return djangoInstance, fmt.Errorf("failed to marshal response data from threeport API: %w", err)
@@ -591,6 +628,10 @@ func DeleteDjangoInstance(apiClient *http.Client, apiAddr string, id uint) (*v0.
 	)
 	if err != nil {
 		return &djangoInstance, fmt.Errorf("call to threeport API returned unexpected response: %w", err)
+	}
+
+	if len(response.Data) == 0 {
+		return &djangoInstance, errors.New("threeport API returned no object in response data")
 	}
 
 	jsonData, err := json.Marshal(response.Data[0])

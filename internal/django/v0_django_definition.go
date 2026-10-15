@@ -11,6 +11,7 @@ import (
 	tpclientlib "github.com/threeport/threeport/pkg/client/lib/v0"
 	tpclient "github.com/threeport/threeport/pkg/client/v0"
 	controller "github.com/threeport/threeport/pkg/controller/v0"
+	encryption "github.com/threeport/threeport/pkg/encryption/v0"
 
 	v0 "django-threeport-module/pkg/api/v0"
 	client_v0 "django-threeport-module/pkg/client/v0"
@@ -50,6 +51,20 @@ func v0DjangoDefinitionCreated(
 		settingsModule = *djangoDefinition.SettingsModule
 	}
 
+	// literal values may be real credentials, so Env is stored encrypted
+	var env []string
+	if djangoDefinition.Env != nil {
+		decrypted, err := encryption.DecryptEnvSlice(*djangoDefinition.Env, r.EncryptionKey)
+		if err != nil {
+			return 0, fmt.Errorf("failed to decrypt django definition env: %w", err)
+		}
+		env = decrypted
+	}
+	var secretEnvVars []v0.DjangoSecretEnvVar
+	if djangoDefinition.SecretEnvVars != nil {
+		secretEnvVars = *djangoDefinition.SecretEnvVars
+	}
+
 	yamlDoc, err := djangoYaml(
 		*djangoDefinition.Name,
 		*djangoDefinition.Image,
@@ -58,6 +73,8 @@ func v0DjangoDefinitionCreated(
 		environment,
 		dbStorageByEnv(environment),
 		runMigrations,
+		env,
+		secretEnvVars,
 	)
 	if err != nil {
 		return 0, fmt.Errorf("failed to generate django YAML manifest: %w", err)

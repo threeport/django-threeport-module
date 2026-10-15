@@ -156,6 +156,23 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					log.Info("django definition scheduled for deletion - skipping create")
 					break
 				}
+				// record in-progress before the custom handler so a later failure still has a start event
+				progressNote := "creating"
+				// type-assert so types without relationship-tagged foreign keys still emit creating
+				if owner, ok := djangoDefinition.(tpapi_v0.RelationshipTaggedForeignKeyProvider); ok {
+					progressNote = event.CreateNote(owner)
+				}
+				if recordErr := r.EventsRecorder.RecordEvent(
+					&tpapi_v0.Event{
+						Note:   util.Ptr(progressNote),
+						Reason: util.Ptr(event.ReasonCreateInProgress),
+						Type:   util.Ptr(event.TypeNormal),
+					},
+					djangoDefinition.GetId(),
+					djangoDefinition.GetFullyQualifiedType(),
+				); recordErr != nil {
+					log.Error(recordErr, "failed to record in-progress event")
+				}
 				var operationErr error
 				var customRequeueDelay int64
 				switch djangoDefinition.GetVersion() {
@@ -176,8 +193,8 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					r.EventsRecorder.HandleEventOverride(
 						&tpapi_v0.Event{
 							Note:   util.Ptr(errorMsg),
-							Reason: util.Ptr(event.ReasonFailedCreate),
-							Type:   util.Ptr(event.TypeNormal),
+							Reason: util.Ptr(event.ReasonCreateFailed),
+							Type:   util.Ptr(event.TypeWarning),
 						},
 						djangoDefinition.GetId(),
 						djangoDefinition.GetFullyQualifiedType(),
@@ -207,6 +224,19 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					log.Info("django definition scheduled for deletion - skipping update")
 					break
 				}
+				// record in-progress before the custom handler so a later failure still has a start event
+				progressNote := event.UpdateNote()
+				if recordErr := r.EventsRecorder.RecordEvent(
+					&tpapi_v0.Event{
+						Note:   util.Ptr(progressNote),
+						Reason: util.Ptr(event.ReasonUpdateInProgress),
+						Type:   util.Ptr(event.TypeNormal),
+					},
+					djangoDefinition.GetId(),
+					djangoDefinition.GetFullyQualifiedType(),
+				); recordErr != nil {
+					log.Error(recordErr, "failed to record in-progress event")
+				}
 				var operationErr error
 				var customRequeueDelay int64
 				switch djangoDefinition.GetVersion() {
@@ -227,8 +257,8 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					r.EventsRecorder.HandleEventOverride(
 						&tpapi_v0.Event{
 							Note:   util.Ptr(errorMsg),
-							Reason: util.Ptr(event.ReasonFailedUpdate),
-							Type:   util.Ptr(event.TypeNormal),
+							Reason: util.Ptr(event.ReasonUpdateFailed),
+							Type:   util.Ptr(event.TypeWarning),
 						},
 						djangoDefinition.GetId(),
 						djangoDefinition.GetFullyQualifiedType(),
@@ -254,6 +284,23 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					continue
 				}
 			case notifications.NotificationOperationDeleted:
+				// record in-progress before the custom handler so a later failure still has a start event
+				progressNote := "deleting"
+				// type-assert so types without relationship-tagged foreign keys still emit deleting
+				if owner, ok := djangoDefinition.(tpapi_v0.RelationshipTaggedForeignKeyProvider); ok {
+					progressNote = event.DeleteNote(owner)
+				}
+				if recordErr := r.EventsRecorder.RecordEvent(
+					&tpapi_v0.Event{
+						Note:   util.Ptr(progressNote),
+						Reason: util.Ptr(event.ReasonDeleteInProgress),
+						Type:   util.Ptr(event.TypeNormal),
+					},
+					djangoDefinition.GetId(),
+					djangoDefinition.GetFullyQualifiedType(),
+				); recordErr != nil {
+					log.Error(recordErr, "failed to record in-progress event")
+				}
 				var operationErr error
 				var customRequeueDelay int64
 				switch djangoDefinition.GetVersion() {
@@ -269,13 +316,27 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					operationErr = errors.New("unrecognized version of django definition encountered for delete operation")
 				}
 				if operationErr != nil {
+					if errors.Is(operationErr, tpclient_lib.ErrDeleteInProgress) || errors.Is(operationErr, tpclient_lib.ErrDeleteBlocked) {
+						log.Info(
+							"conflict reconciling deleted django definition object, requeueing",
+							"cause", operationErr.Error(),
+						)
+						// in-progress event already recorded before the handler
+						r.UnlockAndRequeue(
+							djangoDefinition,
+							int64(30),
+							lockReleased,
+							msg,
+						)
+						continue
+					}
 					errorMsg := "failed to reconcile deleted django definition object"
 					log.Error(operationErr, errorMsg)
 					r.EventsRecorder.HandleEventOverride(
 						&tpapi_v0.Event{
 							Note:   util.Ptr(errorMsg),
-							Reason: util.Ptr(event.ReasonFailedDelete),
-							Type:   util.Ptr(event.TypeNormal),
+							Reason: util.Ptr(event.ReasonDeleteFailed),
+							Type:   util.Ptr(event.TypeWarning),
 						},
 						djangoDefinition.GetId(),
 						djangoDefinition.GetFullyQualifiedType(),
@@ -325,6 +386,20 @@ func DjangoDefinitionReconciler(r *controller.Reconciler) {
 					djangoDefinition.GetId(),
 				)
 				if err != nil {
+					if errors.Is(err, tpclient_lib.ErrDeleteInProgress) || errors.Is(err, tpclient_lib.ErrDeleteBlocked) {
+						log.Info(
+							"conflict deleting django definition, requeueing",
+							"cause", err.Error(),
+						)
+						// in-progress event already recorded before the handler
+						r.UnlockAndRequeue(
+							djangoDefinition,
+							int64(30),
+							lockReleased,
+							msg,
+						)
+						continue
+					}
 					log.Error(err, "failed to delete django definition")
 					r.UnlockAndRequeue(djangoDefinition, requeueDelay, lockReleased, msg)
 					continue

@@ -16,3 +16,15 @@ DjangoInstance:
   # not this field is set, so editing another field here cannot move a running
   # workload to a different cluster. Naming a different runtime in a replace is
   # reported as an error rather than performed.
+
+  # Environment variables for this instance only, layered on top of the
+  # definition's. A name set on both takes the value given here. SecretEnvVars
+  # reference secrets you create in the target namespace beforehand. Applied
+  # when the instance is created and cannot be changed by a replace.
+  #
+  #   Env:
+  #     - FEATURE_X=on
+  #   SecretEnvVars:
+  #     - Name: POSTMARK_API_KEY
+  #       SecretName: myapp-prod-postmark
+  #       SecretKey: api-key

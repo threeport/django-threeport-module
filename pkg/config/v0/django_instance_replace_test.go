@@ -87,7 +87,7 @@ func TestDjangoInstanceConfig_Replace_KeepsTheCurrentRuntime(t *testing.T) {
 		DjangoDefinition: &DjangoDefinitionValues{Name: util.Ptr("myapp")},
 	}}
 
-	_, err := config.Replace(server.Client(), apiAddr(server), "myapp")
+	_, err := config.Replace(server.Client(), apiAddr(server), "myapp", "")
 	require.NoError(t, err)
 	assert.Equal(t, uint(7), sent, "the instance has to stay on the runtime it is already on")
 }
@@ -106,7 +106,7 @@ func TestDjangoInstanceConfig_Replace_RefusesToMove(t *testing.T) {
 		DjangoDefinition:          &DjangoDefinitionValues{Name: util.Ptr("myapp")},
 	}}
 
-	_, err := config.Replace(server.Client(), apiAddr(server), "myapp")
+	_, err := config.Replace(server.Client(), apiAddr(server), "myapp", "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "may not be moved")
 	assert.Zero(t, sent, "nothing should have been written")
@@ -125,7 +125,7 @@ func TestDjangoInstanceConfig_Replace_AcceptsTheSameRuntimeNamed(t *testing.T) {
 		DjangoDefinition:          &DjangoDefinitionValues{Name: util.Ptr("myapp")},
 	}}
 
-	_, err := config.Replace(server.Client(), apiAddr(server), "myapp")
+	_, err := config.Replace(server.Client(), apiAddr(server), "myapp", "")
 	require.NoError(t, err)
 	assert.Equal(t, uint(7), sent)
 }
@@ -146,7 +146,7 @@ func TestDjangoInstanceConfig_Replace_CarriesTheWorkloadInstance(t *testing.T) {
 		DjangoDefinition: &DjangoDefinitionValues{Name: util.Ptr("myapp")},
 	}}
 
-	_, err := config.Replace(server.Client(), apiAddr(server), "myapp")
+	_, err := config.Replace(server.Client(), apiAddr(server), "myapp", "")
 	require.NoError(t, err)
 	assert.Equal(
 		t, uint(42), sentWorkloadInstanceId,

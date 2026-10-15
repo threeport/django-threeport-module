@@ -32,6 +32,13 @@ type DjangoValues struct {
 	Replicas       *int
 	RunMigrations  *bool
 
+	// Additional environment variables. A defined instance is a one-to-one
+	// pair, so there is nothing for an instance-level override to diverge
+	// from: these are set on the definition. Use separate definition and
+	// instance configs to override per instance.
+	Env           *[]string
+	SecretEnvVars []DjangoSecretEnvVarValues
+
 	// instance attributes
 	KubernetesRuntimeInstance *tpconfig_v0.KubernetesRuntimeInstanceValues
 	SubDomain                 *string
@@ -43,11 +50,13 @@ type DjangoValues struct {
 func (d *DjangoConfig) Get(
 	apiClient *http.Client,
 	apiEndpoint string,
+	encryptionKey string,
 ) (*[]DjangoConfig, error) {
 	// get operations
 	operations, djangoDefinitions, djangoInstances := d.GetOperations(
 		apiClient,
 		apiEndpoint,
+		encryptionKey,
 	)
 
 	// execute get operations
@@ -73,6 +82,7 @@ func (d *DjangoConfig) Create(
 	operations, djangoDefinitions, djangoInstances := d.GetOperations(
 		apiClient,
 		apiEndpoint,
+		"",
 	)
 
 	// execute create operations
@@ -95,11 +105,13 @@ func (d *DjangoConfig) Replace(
 	apiClient *http.Client,
 	apiEndpoint string,
 	name string,
+	encryptionKey string,
 ) (*[]DjangoConfig, error) {
 	// get operations
 	operations, djangoDefinitions, djangoInstances := d.GetOperations(
 		apiClient,
 		apiEndpoint,
+		encryptionKey,
 	)
 
 	// execute replace operations
@@ -126,6 +138,7 @@ func (d *DjangoConfig) Delete(
 	operations, _, _ := d.GetOperations(
 		apiClient,
 		apiEndpoint,
+		"",
 	)
 
 	// execute delete operations
@@ -156,6 +169,7 @@ func djangoName(name *string) string {
 func (d *DjangoConfig) GetOperations(
 	apiClient *http.Client,
 	apiEndpoint string,
+	encryptionKey string,
 ) (*util.Operations, *[]DjangoDefinitionConfig, *[]DjangoInstanceConfig) {
 	djangoValues := d.Django
 	var err error
@@ -173,6 +187,8 @@ func (d *DjangoConfig) GetOperations(
 			Environment:    djangoValues.Environment,
 			Replicas:       djangoValues.Replicas,
 			RunMigrations:  djangoValues.RunMigrations,
+			Env:            djangoValues.Env,
+			SecretEnvVars:  djangoValues.SecretEnvVars,
 			Age:            djangoValues.Age,
 		},
 	}
@@ -193,7 +209,7 @@ func (d *DjangoConfig) GetOperations(
 			return nil
 		},
 		Get: func() error {
-			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint)
+			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint, encryptionKey)
 			if err != nil {
 				return fmt.Errorf("failed to get django definitions: %w", err)
 			}
@@ -202,7 +218,7 @@ func (d *DjangoConfig) GetOperations(
 		},
 		Name: "django definition",
 		Replace: func(name string) error {
-			djangoDefinition, err := djangoDefinitionConfig.Replace(apiClient, apiEndpoint, name)
+			djangoDefinition, err := djangoDefinitionConfig.Replace(apiClient, apiEndpoint, name, encryptionKey)
 			if err != nil {
 				return fmt.Errorf("failed to replace django definition with name %s: %w", name, err)
 			}
@@ -239,7 +255,7 @@ func (d *DjangoConfig) GetOperations(
 			return nil
 		},
 		Get: func() error {
-			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint)
+			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint, encryptionKey)
 			if err != nil {
 				return fmt.Errorf("failed to get django instances: %w", err)
 			}
@@ -248,7 +264,7 @@ func (d *DjangoConfig) GetOperations(
 		},
 		Name: "django instance",
 		Replace: func(name string) error {
-			djangoInstance, err := djangoInstanceConfig.Replace(apiClient, apiEndpoint, name)
+			djangoInstance, err := djangoInstanceConfig.Replace(apiClient, apiEndpoint, name, encryptionKey)
 			if err != nil {
 				return fmt.Errorf("failed to replace django instance with name %s: %w", name, err)
 			}
@@ -293,6 +309,8 @@ func mapToDjangoDefinedInstances(
 						Environment:               def.DjangoDefinition.Environment,
 						Replicas:                  def.DjangoDefinition.Replicas,
 						RunMigrations:             def.DjangoDefinition.RunMigrations,
+						Env:                       def.DjangoDefinition.Env,
+						SecretEnvVars:             def.DjangoDefinition.SecretEnvVars,
 						KubernetesRuntimeInstance: inst.DjangoInstance.KubernetesRuntimeInstance,
 						SubDomain:                 inst.DjangoInstance.SubDomain,
 						Age:                       inst.DjangoInstance.Age,

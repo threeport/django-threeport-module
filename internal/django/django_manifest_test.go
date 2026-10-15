@@ -34,7 +34,7 @@ func kindsIn(t *testing.T, doc string) []string {
 // database with its storage and credentials, the migration job, and the
 // application itself.
 func TestDjangoYaml_Resources(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings.production", 2, "dev", 20, true)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings.production", 2, "dev", 20, true, nil, nil)
 	require.NoError(t, err)
 
 	kinds := kindsIn(t, doc)
@@ -53,7 +53,7 @@ func TestDjangoYaml_Resources(t *testing.T) {
 // TestDjangoYaml_MigrationsDisabled covers RunMigrations being false: the job
 // is the only resource that should disappear.
 func TestDjangoYaml_MigrationsDisabled(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "", 1, "dev", 20, false)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "", 1, "dev", 20, false, nil, nil)
 	require.NoError(t, err)
 
 	kinds := kindsIn(t, doc)
@@ -66,11 +66,11 @@ func TestDjangoYaml_MigrationsDisabled(t *testing.T) {
 // Django falls back to its own default when the variable is absent, so an
 // empty value must not be set rather than set to "".
 func TestDjangoYaml_SettingsModuleOmitted(t *testing.T) {
-	withSettings, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings.production", 1, "dev", 20, false)
+	withSettings, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings.production", 1, "dev", 20, false, nil, nil)
 	require.NoError(t, err)
 	assert.Contains(t, withSettings, "DJANGO_SETTINGS_MODULE")
 
-	withoutSettings, err := djangoYaml("myapp", "myorg/myapp:v1", "", 1, "dev", 20, false)
+	withoutSettings, err := djangoYaml("myapp", "myorg/myapp:v1", "", 1, "dev", 20, false, nil, nil)
 	require.NoError(t, err)
 	assert.NotContains(t, withoutSettings, "DJANGO_SETTINGS_MODULE")
 }
@@ -79,7 +79,7 @@ func TestDjangoYaml_SettingsModuleOmitted(t *testing.T) {
 // manifest and the instance reconciler: the manifest names a secret it does not
 // create, so both sides have to derive the same name.
 func TestDjangoYaml_ReferencesTheInstanceSecret(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, false)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, false, nil, nil)
 	require.NoError(t, err)
 
 	assert.Contains(t, doc, DbSecretName("myapp"), "the deployments have to reference the name the reconciler creates")
@@ -90,7 +90,7 @@ func TestDjangoYaml_ReferencesTheInstanceSecret(t *testing.T) {
 // manifest wires SECRET_KEY into. Django will not load its settings without
 // one, so the migration job needs it as much as the application does.
 func TestDjangoYaml_SecretKeyReachesTheApplicationAndMigrations(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true, nil, nil)
 	require.NoError(t, err)
 
 	for _, container := range []string{"django", "migrate"} {
@@ -244,7 +244,7 @@ func TestDbStorageByEnv(t *testing.T) {
 // sys.path rather than the project directory; a server adds the working
 // directory itself, which is why only the job broke.
 func TestDjangoYaml_MigrationJobPythonPath(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true, nil, nil)
 	require.NoError(t, err)
 
 	migrateJob := documentOfKind(t, doc, "Job")
@@ -278,7 +278,7 @@ func documentOfKind(t *testing.T, doc string, kind string) string {
 // connection refused. It completed only because the job retried, which leaves
 // migrations one slow database start away from failing outright.
 func TestDjangoYaml_MigrationWaitsForDatabase(t *testing.T) {
-	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true)
+	doc, err := djangoYaml("myapp", "myorg/myapp:v1", "myapp.settings", 1, "dev", 20, true, nil, nil)
 	require.NoError(t, err)
 
 	migrateJob := documentOfKind(t, doc, "Job")

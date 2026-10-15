@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	kube "github.com/threeport/threeport/pkg/kube/v0"
+
+	v0 "django-threeport-module/pkg/api/v0"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
@@ -67,6 +69,8 @@ func djangoYaml(
 	environment string,
 	dbStorageGb int,
 	runMigrations bool,
+	env []string,
+	secretEnvVars []v0.DjangoSecretEnvVar,
 ) (string, error) {
 	var yamlDoc string
 
@@ -244,6 +248,10 @@ func djangoYaml(
 			"value": settingsModule,
 		})
 	}
+
+	// user-supplied variables go last so they read after the module's own
+	// wiring; reserved names are rejected at the config layer
+	appEnv = append(appEnv, customEnvEntries(env, secretEnvVars)...)
 
 	// django-admin is an installed console script, so Python puts its own
 	// directory on sys.path and not the project's. A server like gunicorn adds

@@ -2,11 +2,14 @@
 
 package v0
 
-import gorm "gorm.io/gorm"
+import (
+	tpapi_lib "github.com/threeport/threeport/pkg/api/lib/v0"
+	gorm "gorm.io/gorm"
+)
 
 // beforeCreate runs before the DjangoDefinition is created.
 func (d *DjangoDefinition) beforeCreate(tx *gorm.DB) error {
-	return nil
+	return validateIncomingEnvVars(d.Env, d.SecretEnvVars)
 }
 
 // beforeUpdate runs before the DjangoDefinition is updated.
@@ -26,6 +29,10 @@ func (d *DjangoDefinition) beforeCreate(tx *gorm.DB) error {
 //
 //	tpapi_lib "github.com/threeport/threeport/pkg/api/lib/v0"
 func (d *DjangoDefinition) beforeUpdate(tx *gorm.DB) error {
+	// under PATCH the receiver is the loaded row, not what the caller sent
+	if incoming, ok := tpapi_lib.IncomingValues(tx).(*DjangoDefinition); ok {
+		return validateIncomingEnvVars(incoming.Env, incoming.SecretEnvVars)
+	}
 	return nil
 }
 
@@ -51,7 +58,7 @@ func (d *DjangoDefinition) afterDelete(tx *gorm.DB) error {
 
 // beforeCreate runs before the DjangoInstance is created.
 func (d *DjangoInstance) beforeCreate(tx *gorm.DB) error {
-	return nil
+	return validateIncomingEnvVars(d.Env, d.SecretEnvVars)
 }
 
 // beforeUpdate runs before the DjangoInstance is updated.
@@ -71,6 +78,10 @@ func (d *DjangoInstance) beforeCreate(tx *gorm.DB) error {
 //
 //	tpapi_lib "github.com/threeport/threeport/pkg/api/lib/v0"
 func (d *DjangoInstance) beforeUpdate(tx *gorm.DB) error {
+	// under PATCH the receiver is the loaded row, not what the caller sent
+	if incoming, ok := tpapi_lib.IncomingValues(tx).(*DjangoInstance); ok {
+		return validateIncomingEnvVars(incoming.Env, incoming.SecretEnvVars)
+	}
 	return nil
 }
 

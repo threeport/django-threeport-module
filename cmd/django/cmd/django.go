@@ -19,7 +19,36 @@ var (
 	djangoStdin      bool
 	djangoVersion    string
 	djangoOutput     string
+	djangoDecrypt    bool
 )
+
+// getEncryptionKey returns the control plane's encryption key when the user
+// asked for secrets to be decrypted, and an empty string otherwise, which makes
+// the config layer redact encrypted values instead.
+func getEncryptionKey(requestedControlPlane string) string {
+	if !djangoDecrypt {
+		return ""
+	}
+	return controlPlaneEncryptionKey(requestedControlPlane)
+}
+
+// controlPlaneEncryptionKey reads the control plane's encryption key from the
+// threeport config. Replace needs it regardless of any flag: the stored
+// literal env values are encrypted, and checking that a replace leaves them
+// unchanged means decrypting them.
+func controlPlaneEncryptionKey(requestedControlPlane string) string {
+	threeportConfig, _, err := cli.GetThreeportConfig(cliArgs.ControlPlaneName)
+	if err != nil {
+		cli.Error("failed to get threeport config", err)
+		os.Exit(1)
+	}
+	key, err := threeportConfig.GetThreeportEncryptionKey(requestedControlPlane)
+	if err != nil {
+		cli.Error("failed to get encryption key from threeport config", err)
+		os.Exit(1)
+	}
+	return key
+}
 
 ///////////////////////////////////////////////////////////////////////////////
 // Django
@@ -68,7 +97,7 @@ var GetDjangosCmd = &cobra.Command{
 			}
 
 			// get django
-			djangoConfigs, err := djangoConfig.Get(apiClient, apiEndpoint)
+			djangoConfigs, err := djangoConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django", err)
 				os.Exit(1)
@@ -136,6 +165,10 @@ func init() {
 	GetDjangosCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangosCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 
@@ -325,7 +358,7 @@ var GetDjangoDefinitionsCmd = &cobra.Command{
 			}
 
 			// get django definitions
-			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint)
+			djangoDefinitions, err := djangoDefinitionConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django definitions", err)
 				os.Exit(1)
@@ -393,6 +426,10 @@ func init() {
 	GetDjangoDefinitionsCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangoDefinitionsCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 
@@ -464,7 +501,7 @@ var ReplaceDjangoDefinitionCmd = &cobra.Command{
 	Long:    "Replace an existing django definition.\n Note that the entire object will replaced with a PUT request.\n All fields must be provided in the config file.",
 	PreRun:  CommandPreRunFunc,
 	Run: func(cmd *cobra.Command, args []string) {
-		apiClient, _, apiEndpoint, _ := tptctl_cmd.GetClientContext(cmd)
+		apiClient, _, apiEndpoint, requestedControlPlane := tptctl_cmd.GetClientContext(cmd)
 
 		// replace django definition based on version
 		switch djangoVersion {
@@ -482,7 +519,7 @@ var ReplaceDjangoDefinitionCmd = &cobra.Command{
 			}
 
 			// replace django definition
-			updatedDjangoDefinition, err := djangoDefinitionConfig.Replace(apiClient, apiEndpoint, djangoName)
+			updatedDjangoDefinition, err := djangoDefinitionConfig.Replace(apiClient, apiEndpoint, djangoName, controlPlaneEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to update django definition", err)
 				os.Exit(1)
@@ -651,7 +688,7 @@ var GetDjangoInstancesCmd = &cobra.Command{
 			}
 
 			// get django instances
-			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint)
+			djangoInstances, err := djangoInstanceConfig.Get(apiClient, apiEndpoint, getEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to retrieve django instances", err)
 				os.Exit(1)
@@ -719,6 +756,10 @@ func init() {
 	GetDjangoInstancesCmd.Flags().StringVarP(
 		&cliArgs.ControlPlaneName,
 		"control-plane-name", "i", "", "Optional. Name of control plane. Will default to current control plane if not provided.",
+	)
+	GetDjangoInstancesCmd.Flags().BoolVarP(
+		&djangoDecrypt,
+		"decrypt-secrets", "d", false, "Decrypt any encrypted secrets in output.",
 	)
 }
 
@@ -790,7 +831,7 @@ var ReplaceDjangoInstanceCmd = &cobra.Command{
 	Long:    "Replace an existing django instance.\n Note that the entire object will replaced with a PUT request.\n All fields must be provided in the config file.",
 	PreRun:  CommandPreRunFunc,
 	Run: func(cmd *cobra.Command, args []string) {
-		apiClient, _, apiEndpoint, _ := tptctl_cmd.GetClientContext(cmd)
+		apiClient, _, apiEndpoint, requestedControlPlane := tptctl_cmd.GetClientContext(cmd)
 
 		// replace django instance based on version
 		switch djangoVersion {
@@ -808,7 +849,7 @@ var ReplaceDjangoInstanceCmd = &cobra.Command{
 			}
 
 			// replace django instance
-			updatedDjangoInstance, err := djangoInstanceConfig.Replace(apiClient, apiEndpoint, djangoName)
+			updatedDjangoInstance, err := djangoInstanceConfig.Replace(apiClient, apiEndpoint, djangoName, controlPlaneEncryptionKey(requestedControlPlane))
 			if err != nil {
 				cli.Error("failed to update django instance", err)
 				os.Exit(1)
